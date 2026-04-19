@@ -15,6 +15,9 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
     private let decodeQueue = DispatchQueue(label: "com.parrotisle.decode", qos: .userInitiated)
     
     private var recognizer: SherpaOnnxRecognizer?
+    private var vad: SherpaOnnxVoiceActivityDetectorWrapper? // <-- Thêm VAD
+    private var wasSpeechDetected = false                    // <-- Cờ theo dõi trạng thái
+    
     private var scStream: SCStream?
     private var streamBridge: StreamBridge?
     
@@ -47,9 +50,10 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
         await sendStatus("Initializing model...")
         
         guard let encoderPath = Bundle.main.path(forResource: "encoder", ofType: "onnx"),
-              let decoderPath = Bundle.main.path(forResource: "decoder", ofType: "onnx"),
-              let joinerPath  = Bundle.main.path(forResource: "joiner", ofType: "onnx"),
-              let tokensPath  = Bundle.main.path(forResource: "tokens", ofType: "txt")
+            let decoderPath = Bundle.main.path(forResource: "decoder", ofType: "onnx"),
+            let joinerPath  = Bundle.main.path(forResource: "joiner", ofType: "onnx"),
+            let tokensPath  = Bundle.main.path(forResource: "tokens", ofType: "txt"),
+            let vadPath = Bundle.main.path(forResource: "silero_vad", ofType: "onnx")
         else {
             await sendStatus("Error: Model files not found.")
             return
@@ -73,8 +77,29 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
             
             let newRecognizer = await SherpaOnnxRecognizer(config: &config)
             
+            // Khởi tạo VAD
+            var sileroVadConfig = await sherpaOnnxSileroVadModelConfig(
+                model: vadPath,
+                threshold: 0.5,           // Độ nhạy (0.5 là chuẩn, giảm xuống nếu mic nhỏ)
+                minSilenceDuration: 0.25, // Giây: Thời gian im lặng tối thiểu để ngắt
+                minSpeechDuration: 0.25,  // Giây: Thời gian nói tối thiểu để tính là đang nói
+                windowSize: 512           // Chuẩn của Silero
+            )
+            
+            var vadConfig = await sherpaOnnxVadModelConfig(
+                sileroVad: sileroVadConfig,
+                sampleRate: Int32(self.sampleRate),
+                numThreads: 1,
+                provider: "cpu"
+            )
+            
+            // Khởi tạo VAD wrapper (buffer_size_in_seconds để 60s cho thoải mái)
+            let newVad = await SherpaOnnxVoiceActivityDetectorWrapper(config: &vadConfig, buffer_size_in_seconds: 60)
+            
             self.decodeQueue.async {
                 self.recognizer = newRecognizer
+                self.vad = newVad
+                self.wasSpeechDetected = false
                 Task {
                     await self.sendStatus("Ready!")
                     await MainActor.run { self.onModelReady?() }
@@ -146,7 +171,7 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
     
     // Hàm này CHỈ CHẠY TRÊN audioQueue (cực nhanh, không block)
     func ingestSamples(_ samples: [Float]) {
-        guard isCapturing, let recognizer = recognizer else { return }
+        guard isCapturing, let recognizer = recognizer, let vad = vad else { return }
         
         var cleanSamples = samples
         for i in 0..<cleanSamples.count {
@@ -155,33 +180,50 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
             }
         }
         
-        // Mớm data vào C++ buffer. Tuyệt đối không gọi decode() ở đây!
-        recognizer.acceptWaveform(samples: cleanSamples, sampleRate: sampleRate)
+        // 1. Bơm audio vào VAD trước
+        vad.acceptWaveform(samples: cleanSamples)
+        
+        // 2. Hỏi VAD xem đoạn audio vừa rồi có tiếng người không
+        let isSpeech = vad.isSpeechDetected()
+        
+        if isSpeech {
+            // MỞ VAN: Có tiếng người thì mới bơm cho ASR giải mã
+            recognizer.acceptWaveform(samples: cleanSamples, sampleRate: sampleRate)
+            wasSpeechDetected = true
+        } else {
+            // KHÓA VAN: Đang im lặng
+            if wasSpeechDetected {
+                // NẾU vừa nãy đang nói mà bây giờ im bặt -> Báo cho ASR chốt câu!
+                recognizer.inputFinished()
+                wasSpeechDetected = false
+            }
+            // Nếu vốn dĩ đang im lặng rồi thì drop luôn cleanSamples, cứu CPU!
+        }
     }
     
     // Vòng lặp này CHỈ CHẠY TRÊN decodeQueue (độc lập hoàn toàn)
-        private func startDecodingLoop() {
-            decodeQueue.async { [weak self] in
-                guard let self = self else { return }
-                
-                // Lặp vĩnh cửu cho đến khi isCapturing = false
-                while self.isCapturing {
-                    guard let recognizer = self.recognizer else {
-                        Thread.sleep(forTimeInterval: 0.05)
-                        continue
-                    }
-                    
-                    // Giải mã và mớm text ra UI NGAY LẬP TỨC
-                    while recognizer.isReady() {
-                        recognizer.decode()
-                        self.processRecognizedText(recognizer: recognizer)
-                    }
-                    
-                    // Ngủ 20ms để nhường CPU, tránh ăn 100% Core khi không có ai nói gì
-                    Thread.sleep(forTimeInterval: 0.02)
+    private func startDecodingLoop() {
+        decodeQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Lặp vĩnh cửu cho đến khi isCapturing = false
+            while self.isCapturing {
+                guard let recognizer = self.recognizer else {
+                    Thread.sleep(forTimeInterval: 0.05)
+                    continue
                 }
+                
+                // Giải mã và mớm text ra UI NGAY LẬP TỨC
+                while recognizer.isReady() {
+                    recognizer.decode()
+                    self.processRecognizedText(recognizer: recognizer)
+                }
+                
+                // Ngủ 20ms để nhường CPU, tránh ăn 100% Core khi không có ai nói gì
+                Thread.sleep(forTimeInterval: 0.02)
             }
         }
+    }
     
     // Hàm này được gọi bởi decodeQueue
     private func processRecognizedText(recognizer: SherpaOnnxRecognizer) {
