@@ -2,32 +2,13 @@ import Foundation
 import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
-import Translation
-
-// MARK: - Data Model
-struct SubtitleSnapshot: Sendable {
-    let stableLines: [String]
-    let pendingText: String
-    
-    var displayText: String {
-        let parts = (stableLines + [pendingText])
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        return parts.joined(separator: "\n")
-    }
-}
 
 // MARK: - Audio Stream Manager
 final class AudioStreamManager: NSObject, @unchecked Sendable {
     private let sampleRate = 16_000
     private let sherpaQueue = DispatchQueue(label: "com.parrotisle.sherpa", qos: .userInitiated)
     
-    private var translationSession: TranslationSession?
-    private let sessionLock = NSLock()
-    
-    private var activeTranslationTask: Task<Void, Never>?
     private var isDecodingRunning = false
-
     private var recognizer: SherpaOnnxRecognizer?
     private var scStream: SCStream?
     private var streamBridge: StreamBridge?
@@ -37,28 +18,20 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
     private var liveText: String = ""
 
     // Callbacks
-    var onSubtitleSnapshot: (@MainActor @Sendable (SubtitleSnapshot) -> Void)?
+    var onTranscriptionUpdate: (@MainActor @Sendable (String) -> Void)?
     var onModelReady: (@MainActor @Sendable () -> Void)?
     var onStatusChanged: (@MainActor @Sendable (String) -> Void)?
-
-    private let defaults = UserDefaults.standard
 
     override init() { super.init() }
 
     func setCallbacks(
         onModelReady: (@MainActor @Sendable () -> Void)?,
         onStatusChanged: (@MainActor @Sendable (String) -> Void)?,
-        onSubtitleSnapshot: (@MainActor @Sendable (SubtitleSnapshot) -> Void)?
+        onTranscriptionUpdate: (@MainActor @Sendable (String) -> Void)?
     ) {
         self.onModelReady = onModelReady
         self.onStatusChanged = onStatusChanged
-        self.onSubtitleSnapshot = onSubtitleSnapshot
-    }
-
-    func setTranslationSession(_ session: TranslationSession?) {
-        sessionLock.lock()
-        self.translationSession = session
-        sessionLock.unlock()
+        self.onTranscriptionUpdate = onTranscriptionUpdate
     }
 
     // MARK: - Setup & Capture
@@ -118,7 +91,6 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
             let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
             let streamConfig = SCStreamConfiguration()
             
-            // CHỈ THU AUDIO - Bỏ Video để tránh lỗi đồng bộ luồng
             streamConfig.capturesAudio = true
             streamConfig.excludesCurrentProcessAudio = true
             streamConfig.sampleRate = sampleRate
@@ -159,8 +131,6 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
         streamBridge = nil
         isCapturing = false
         
-        activeTranslationTask?.cancel()
-        
         sherpaQueue.async {
             self.isDecodingRunning = false
             self.committedText = ""
@@ -197,7 +167,6 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
             didDecode = true
         }
 
-        // CHỈ check và cập nhật text nếu Sherpa có nhai thêm data
         if didDecode {
             if let partialText = recognizer.getResult()?.text.trimmingCharacters(in: .whitespacesAndNewlines) {
                 let changed = partialText != liveText
@@ -240,76 +209,15 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
     }
 
     private func pushSnapshot() {
-        let rawCommitted = committedText
-        let rawLive = liveText
-        
-        let sourceId = defaults.string(forKey: "sourceLanguage") ?? "en"
-        let targetId = defaults.string(forKey: "targetLanguage") ?? "none"
-        let isTranslating = (targetId != "none" && sourceId != targetId)
-        
-        let fullRawText = [rawCommitted, rawLive]
+        let fullRawText = [committedText, liveText]
             .filter { !$0.isEmpty }
             .joined(separator: " ")
         
         guard !fullRawText.isEmpty else { return }
         
-        // 1. NẾU KHÔNG DỊCH: Bắn thẳng UI, không Debounce (Cực nhạy)
-        if !isTranslating {
-            activeTranslationTask?.cancel()
-            let displayLines = self.formatToLines(text: fullRawText)
-            let snapshot = SubtitleSnapshot(stableLines: displayLines, pendingText: "")
-            
-            if let cb = self.onSubtitleSnapshot {
-                Task { @MainActor in cb(snapshot) }
-            }
-            return
+        if let cb = self.onTranscriptionUpdate {
+            Task { @MainActor in cb(fullRawText) }
         }
-        
-        // 2. NẾU CÓ DỊCH: Sử dụng Debounce 250ms để chống crash/spam API Apple
-        activeTranslationTask?.cancel()
-        
-        sessionLock.lock()
-        let currentSession = translationSession
-        sessionLock.unlock()
-        
-        activeTranslationTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            if Task.isCancelled { return }
-            
-            var translatedText = fullRawText
-            if let session = currentSession {
-                do {
-                    let response = try await session.translations(from: [TranslationSession.Request(sourceText: fullRawText)])
-                    if Task.isCancelled { return }
-                    translatedText = response.first?.targetText ?? fullRawText
-                } catch {
-                    if !(error is CancellationError) { print("Translation error: \(error)") }
-                }
-            }
-            
-            if Task.isCancelled { return }
-            
-            let displayLines = self?.formatToLines(text: translatedText) ?? []
-            let snapshot = SubtitleSnapshot(stableLines: displayLines, pendingText: "")
-            
-            if let cb = self?.onSubtitleSnapshot {
-                await MainActor.run { cb(snapshot) }
-            }
-        }
-    }
-    
-    // Hàm format chữ tách ra cho gọn
-    private func formatToLines(text: String) -> [String] {
-        let words = text.split(separator: " ").map { String($0) }
-        var lines: [String] = []
-        var currentLine = ""
-        for word in words {
-            if currentLine.isEmpty { currentLine = word }
-            else if currentLine.count + 1 + word.count <= 45 { currentLine += " " + word }
-            else { lines.append(currentLine); currentLine = word }
-        }
-        if !currentLine.isEmpty { lines.append(currentLine) }
-        return Array(lines.suffix(2))
     }
 
     private func sendStatus(_ msg: String) async {
@@ -382,3 +290,4 @@ private final class StreamBridge: NSObject, SCStreamOutput, SCStreamDelegate, @u
         return result
     }
 }
+

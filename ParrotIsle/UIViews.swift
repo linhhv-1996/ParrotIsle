@@ -18,8 +18,9 @@ enum AppStatus: Equatable {
 @MainActor
 final class UIState: ObservableObject {
     @Published var status: AppStatus = .loadingApp
+    
+    @Published var rawTranscription: String = ""
     @Published var stableLines: [String] = []
-    @Published var pendingText = ""
     
     var isRecording: Bool { status == .recording }
     var hasScreenRecordPermission: Bool = false
@@ -28,16 +29,7 @@ final class UIState: ObservableObject {
     private let audioManager = AudioStreamManager()
 
     var displayText: String {
-        (stableLines + [pendingText])
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
-    }
-    
-    func setTranslationSession(_ session: TranslationSession) {
-        Task {
-            await audioManager.setTranslationSession(session)
-        }
+        return stableLines.joined(separator: "\n")
     }
 
     init() {
@@ -72,12 +64,24 @@ final class UIState: ObservableObject {
                     self?.status = .loadingModel
                 }
             },
-            onSubtitleSnapshot: { [weak self] snapshot in
-                Task { @MainActor [weak self] in
-                    self?.updateSubtitle(snapshot)
-                }
+            onTranscriptionUpdate: { [weak self] rawText in
+                self?.rawTranscription = rawText
             }
         )
+    }
+    
+    func updateDisplay(with text: String) {
+        let words = text.split(separator: " ").map { String($0) }
+        var lines: [String] = []
+        var currentLine = ""
+        for word in words {
+            if currentLine.isEmpty { currentLine = word }
+            else if currentLine.count + 1 + word.count <= 45 { currentLine += " " + word }
+            else { lines.append(currentLine); currentLine = word }
+        }
+        if !currentLine.isEmpty { lines.append(currentLine) }
+        
+        self.stableLines = Array(lines.suffix(2))
     }
     
     func checkPermission() {
@@ -96,7 +100,6 @@ final class UIState: ObservableObject {
     }
     
     private func updateStatusBasedOnState() {
-        // KHÔNG update status linh tinh nếu đang thu âm
         if status == .recording { return }
         
         if !hasScreenRecordPermission {
@@ -110,11 +113,6 @@ final class UIState: ObservableObject {
         } else {
             status = .ready
         }
-    }
-
-    private func updateSubtitle(_ snapshot: SubtitleSnapshot) {
-        stableLines = snapshot.stableLines
-        pendingText = snapshot.pendingText
     }
 
     func toggleRecording() {
@@ -131,12 +129,10 @@ final class UIState: ObservableObject {
     }
 
     private func startRecording() {
-        // Đổi UI ngay lập tức cho mượt
         status = .recording
         Task {
             let didStart = await audioManager.startCapture()
             if !didStart {
-                // Nếu backend fail, trả lại trạng thái cũ
                 await MainActor.run {
                     self.status = .ready
                     self.updateStatusBasedOnState()
@@ -146,21 +142,18 @@ final class UIState: ObservableObject {
     }
 
     func stopRecording() {
-        // Đổi UI ngay lập tức thoát khỏi trạng thái recording
         self.status = .ready
-        stableLines = []
-        pendingText = ""
+        self.rawTranscription = ""
+        self.stableLines = []
         
         Task {
-            // Backend từ từ ngắt stream sau
             await audioManager.stopCapture()
             await MainActor.run { self.updateStatusBasedOnState() }
         }
     }
 }
 
-
-// MARK: - Views (Phần UI giữ nguyên)
+// MARK: - Views
 struct DynamicIslandView: View {
     @ObservedObject var uiState: UIState
     
@@ -217,9 +210,28 @@ struct DynamicIslandView: View {
         .padding(.top, 6)
         .animation(.spring(response: 0.4, dampingFraction: 0.8), value: isSettingsMode)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onChange(of: uiState.rawTranscription) { _, newText in
+            if translationConfig == nil {
+                uiState.updateDisplay(with: newText)
+            }
+        }
         .translationTask(translationConfig) { session in
-            uiState.setTranslationSession(session)
-            try? await Task.sleep(for: .seconds(1_000_000_000))
+            for await textToTranslate in uiState.$rawTranscription.values {
+                if Task.isCancelled { break }
+                guard !textToTranslate.isEmpty else { continue }
+                
+                do {
+                    let req = TranslationSession.Request(sourceText: textToTranslate)
+                    let responses = try await session.translations(from: [req])
+                    if let translatedText = responses.first?.targetText {
+                        await MainActor.run {
+                            uiState.updateDisplay(with: translatedText)
+                        }
+                    }
+                } catch {
+                    if !(error is CancellationError) { print("Translation err: \(error)") }
+                }
+            }
         }
         .onChange(of: sourceLanguage) { _, newValue in
             updateTranslationConfig(source: newValue, target: targetLanguage)
@@ -439,3 +451,4 @@ struct DynamicIslandView: View {
         .onHover { isHovered.wrappedValue = $0 }
     }
 }
+
