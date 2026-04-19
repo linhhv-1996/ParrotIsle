@@ -225,6 +225,24 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
             await MainActor.run { cb(msg) }
         }
     }
+    
+    // MARK: - Cleanup
+    func shutdown() {
+        // 1. Dừng ngay việc nhận audio mới
+        isCapturing = false
+        let s = scStream
+        scStream = nil
+        streamBridge = nil
+        
+        // 2. Dừng ScreenCaptureKit stream (chạy nền để không block)
+        Task.detached { try? await s?.stopCapture() }
+        
+        // 3. Khóa queue lại để đợi decode() hiện tại chạy xong, sau đó hủy model
+        sherpaQueue.sync {
+            self.isDecodingRunning = false
+            self.recognizer = nil // Gọi deinit của C++ một cách an toàn
+        }
+    }
 }
 
 // Lớp cầu nối Audio
@@ -290,4 +308,3 @@ private final class StreamBridge: NSObject, SCStreamOutput, SCStreamDelegate, @u
         return result
     }
 }
-

@@ -151,6 +151,15 @@ final class UIState: ObservableObject {
             await MainActor.run { self.updateStatusBasedOnState() }
         }
     }
+    
+    func shutdownAndQuit() {
+        audioManager.shutdown()
+        NSApplication.shared.terminate(nil)
+    }
+
+    func handleAppTermination() {
+        audioManager.shutdown()
+    }
 }
 
 // MARK: - Views
@@ -282,7 +291,7 @@ struct DynamicIslandView: View {
                 }
                 
                 CircleButton(icon: "xmark", isHovered: $isQuitHovered, activeColor: .red.opacity(0.7)) {
-                    NSApplication.shared.terminate(nil)
+                    uiState.shutdownAndQuit()
                 }
             }
             
