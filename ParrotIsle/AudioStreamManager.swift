@@ -6,12 +6,19 @@ import CoreMedia
 // MARK: - Audio Stream Manager
 final class AudioStreamManager: NSObject, @unchecked Sendable {
     private let sampleRate = 16_000
-    private let sherpaQueue = DispatchQueue(label: "com.parrotisle.sherpa", qos: .userInitiated)
     
-    private var isDecodingRunning = false
+    // 1. TÁCH 2 QUEUE RÕ RÀNG NHƯ BẠN NÓI
+    // Queue chuyên nhận Audio cực nhanh (User Interactive)
+    private let audioQueue = DispatchQueue(label: "com.parrotisle.audio", qos: .userInteractive)
+    
+    // Queue chuyên chạy vòng lặp Decode nặng nề (User Initiated)
+    private let decodeQueue = DispatchQueue(label: "com.parrotisle.decode", qos: .userInitiated)
+    
     private var recognizer: SherpaOnnxRecognizer?
     private var scStream: SCStream?
     private var streamBridge: StreamBridge?
+    
+    // Dùng cờ báo hiệu để kiểm soát vòng lặp decode
     private var isCapturing = false
 
     private var committedText: String = ""
@@ -51,22 +58,22 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             
-            let featConfig = sherpaOnnxFeatureConfig(sampleRate: self.sampleRate, featureDim: 80)
-            let transducerConfig = sherpaOnnxOnlineTransducerModelConfig(encoder: encoderPath, decoder: decoderPath, joiner: joinerPath)
-            let modelConfig = sherpaOnnxOnlineModelConfig(tokens: tokensPath, transducer: transducerConfig, numThreads: 4, debug: 0)
+            let featConfig = await sherpaOnnxFeatureConfig(sampleRate: self.sampleRate, featureDim: 80)
+            let transducerConfig = await sherpaOnnxOnlineTransducerModelConfig(encoder: encoderPath, decoder: decoderPath, joiner: joinerPath)
+            let modelConfig = await sherpaOnnxOnlineModelConfig(tokens: tokensPath, transducer: transducerConfig, numThreads: 4, debug: 0)
             
-            var config = sherpaOnnxOnlineRecognizerConfig(
+            var config = await sherpaOnnxOnlineRecognizerConfig(
                 featConfig: featConfig,
                 modelConfig: modelConfig,
                 enableEndpoint: true,
-                rule1MinTrailingSilence: 1.2,
-                rule2MinTrailingSilence: 0.8,
+                rule1MinTrailingSilence: 0.6,
+                rule2MinTrailingSilence: 0.5,
                 rule3MinUtteranceLength: 20.0
             )
             
-            let newRecognizer = SherpaOnnxRecognizer(config: &config)
+            let newRecognizer = await SherpaOnnxRecognizer(config: &config)
             
-            self.sherpaQueue.async {
+            self.decodeQueue.async {
                 self.recognizer = newRecognizer
                 Task {
                     await self.sendStatus("Ready!")
@@ -77,8 +84,7 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
     }
     
     func startCapture() async -> Bool {
-        let isReady = sherpaQueue.sync { recognizer != nil }
-        guard isReady else {
+        guard recognizer != nil else {
             await sendStatus("Model is not ready.")
             return false
         }
@@ -101,7 +107,7 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
             self.streamBridge = bridge
             let newStream = SCStream(filter: filter, configuration: streamConfig, delegate: bridge)
             
-            let audioQueue = DispatchQueue(label: "com.parrotisle.audio", qos: .userInteractive)
+            // Ép ScreenCaptureKit đẩy audio vào audioQueue của chúng ta
             try newStream.addStreamOutput(bridge, type: .audio, sampleHandlerQueue: audioQueue)
             
             try await newStream.startCapture()
@@ -109,13 +115,15 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
             scStream = newStream
             isCapturing = true
             
-            sherpaQueue.async {
+            // Reset trạng thái
+            decodeQueue.async {
                 self.committedText = ""
                 self.liveText = ""
                 self.recognizer?.reset()
-                self.isDecodingRunning = true
-                self.runDecodingLoop()
             }
+            
+            // KÍCH HOẠT VÒNG LẶP DECODE ĐỘC LẬP
+            startDecodingLoop()
             
             await sendStatus("Listening to system audio...")
             return true
@@ -129,82 +137,92 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
         let s = scStream
         scStream = nil
         streamBridge = nil
-        isCapturing = false
-        
-        sherpaQueue.async {
-            self.isDecodingRunning = false
-            self.committedText = ""
-            self.liveText = ""
-            self.recognizer?.reset()
-        }
+        isCapturing = false // Cờ này sẽ làm vòng lặp decode tự chết
         
         Task.detached { try? await s?.stopCapture() }
     }
 
     // MARK: - Core Realtime Processing
+    
+    // Hàm này CHỈ CHẠY TRÊN audioQueue (cực nhanh, không block)
     func ingestSamples(_ samples: [Float]) {
-        guard isCapturing else { return }
+        guard isCapturing, let recognizer = recognizer else { return }
         
-        sherpaQueue.async { [weak self] in
-            guard let self = self, self.isCapturing, let recognizer = self.recognizer else { return }
-            
-            var cleanSamples = samples
-            for i in 0..<cleanSamples.count {
-                if cleanSamples[i].isNaN || cleanSamples[i].isInfinite {
-                    cleanSamples[i] = 0.0
-                }
+        var cleanSamples = samples
+        for i in 0..<cleanSamples.count {
+            if cleanSamples[i].isNaN || cleanSamples[i].isInfinite {
+                cleanSamples[i] = 0.0
             }
-            recognizer.acceptWaveform(samples: cleanSamples, sampleRate: self.sampleRate)
         }
+        
+        // Mớm data vào C++ buffer. Tuyệt đối không gọi decode() ở đây!
+        recognizer.acceptWaveform(samples: cleanSamples, sampleRate: sampleRate)
     }
-
-    private func runDecodingLoop() {
-        guard isDecodingRunning, let recognizer = recognizer else { return }
-        
-        var didDecode = false
-        while recognizer.isReady() {
-            recognizer.decode()
-            didDecode = true
-        }
-
-        if didDecode {
-            if let partialText = recognizer.getResult()?.text.trimmingCharacters(in: .whitespacesAndNewlines) {
-                let changed = partialText != liveText
-                if changed {
-                    liveText = partialText
-                    pushSnapshot()
-                }
-
-                if recognizer.isEndpoint() {
-                    if !liveText.isEmpty {
-                        let separator = committedText.isEmpty ? "" : " "
-                        let combined = committedText + separator + liveText
-                        let words = combined.split(separator: " ").map { String($0) }
-                        
-                        var tempLines: [String] = []
-                        var tLine = ""
-                        for w in words {
-                            if tLine.isEmpty { tLine = w }
-                            else if tLine.count + 1 + w.count <= 40 { tLine += " " + w }
-                            else { tempLines.append(tLine); tLine = w }
-                        }
-                        if !tLine.isEmpty { tempLines.append(tLine) }
-                        
-                        if tempLines.count > 4 {
-                            committedText = tempLines.suffix(4).joined(separator: " ")
-                        } else {
-                            committedText = combined
-                        }
+    
+    // Vòng lặp này CHỈ CHẠY TRÊN decodeQueue (độc lập hoàn toàn)
+        private func startDecodingLoop() {
+            decodeQueue.async { [weak self] in
+                guard let self = self else { return }
+                
+                // Lặp vĩnh cửu cho đến khi isCapturing = false
+                while self.isCapturing {
+                    guard let recognizer = self.recognizer else {
+                        Thread.sleep(forTimeInterval: 0.05)
+                        continue
                     }
-                    liveText = ""
-                    pushSnapshot()
-                    recognizer.reset()
+                    
+                    // Giải mã và mớm text ra UI NGAY LẬP TỨC
+                    while recognizer.isReady() {
+                        recognizer.decode()
+                        self.processRecognizedText(recognizer: recognizer)
+                    }
+                    
+                    // Ngủ 20ms để nhường CPU, tránh ăn 100% Core khi không có ai nói gì
+                    Thread.sleep(forTimeInterval: 0.02)
                 }
             }
         }
-        
-        sherpaQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.runDecodingLoop()
+    
+    // Hàm này được gọi bởi decodeQueue
+    private func processRecognizedText(recognizer: SherpaOnnxRecognizer) {
+        if let partialText = recognizer.getResult()?.text.trimmingCharacters(in: .whitespacesAndNewlines) {
+            
+            if partialText != liveText {
+                liveText = partialText
+                pushSnapshot()
+            }
+
+            // CHỈ ép ngắt cứng nếu câu dài bất thường (người dùng nói > 50 từ không hề nghỉ thở)
+            // Còn bình thường sẽ dựa vào isEndpoint() để ngắt một cách tự nhiên.
+            let isTextTooLong = liveText.count > 250
+            
+            if recognizer.isEndpoint() || isTextTooLong {
+                if !liveText.isEmpty {
+                    let separator = committedText.isEmpty ? "" : " "
+                    let combined = committedText + separator + liveText
+                    let words = combined.split(separator: " ").map { String($0) }
+                    
+                    var tempLines: [String] = []
+                    var tLine = ""
+                    for w in words {
+                        if tLine.isEmpty { tLine = w }
+                        else if tLine.count + 1 + w.count <= 40 { tLine += " " + w }
+                        else { tempLines.append(tLine); tLine = w }
+                    }
+                    if !tLine.isEmpty { tempLines.append(tLine) }
+                    
+                    if tempLines.count > 4 {
+                        committedText = tempLines.suffix(4).joined(separator: " ")
+                    } else {
+                        committedText = combined
+                    }
+                }
+                liveText = ""
+                pushSnapshot()
+                
+                // Xả rác bộ nhớ của Model một cách mượt mà
+                recognizer.reset()
+            }
         }
     }
 
@@ -228,19 +246,14 @@ final class AudioStreamManager: NSObject, @unchecked Sendable {
     
     // MARK: - Cleanup
     func shutdown() {
-        // 1. Dừng ngay việc nhận audio mới
         isCapturing = false
         let s = scStream
         scStream = nil
         streamBridge = nil
-        
-        // 2. Dừng ScreenCaptureKit stream (chạy nền để không block)
         Task.detached { try? await s?.stopCapture() }
         
-        // 3. Khóa queue lại để đợi decode() hiện tại chạy xong, sau đó hủy model
-        sherpaQueue.sync {
-            self.isDecodingRunning = false
-            self.recognizer = nil // Gọi deinit của C++ một cách an toàn
+        decodeQueue.sync {
+            self.recognizer = nil
         }
     }
 }
