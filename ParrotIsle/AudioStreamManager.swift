@@ -322,7 +322,7 @@ private final class StreamBridge: NSObject, SCStreamOutput, SCStreamDelegate, @u
         guard let mgr = manager else { return }
         mgr.stopCapture()
         Task { [weak mgr] in
-            if let cb = mgr?.onStatusChanged {
+            if let cb = await mgr?.onStatusChanged {
                 await MainActor.run { cb("Capture stopped: \(error.localizedDescription)") }
             }
         }
