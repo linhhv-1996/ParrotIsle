@@ -18,17 +18,17 @@ struct SubtitleSnapshot: Sendable {
 }
 
 // MARK: - Audio Stream Manager
-actor AudioStreamManager: NSObject {
-    // MARK: Constants
+final class AudioStreamManager: NSObject, @unchecked Sendable {
     private let sampleRate = 16_000
+    private let sherpaQueue = DispatchQueue(label: "com.parrotisle.sherpa", qos: .userInitiated)
     
     private var translationSession: TranslationSession?
-    private var activeTranslationTask: Task<Void, Never>?
-
-    // MARK: Sherpa State (Đã sửa theo đúng class trong SherpaOnnx.swift)
-    private var recognizer: SherpaOnnxRecognizer?
+    private let sessionLock = NSLock()
     
-    // MARK: Capture State
+    private var activeTranslationTask: Task<Void, Never>?
+    private var isDecodingRunning = false
+
+    private var recognizer: SherpaOnnxRecognizer?
     private var scStream: SCStream?
     private var streamBridge: StreamBridge?
     private var isCapturing = false
@@ -41,6 +41,10 @@ actor AudioStreamManager: NSObject {
     var onModelReady: (@MainActor @Sendable () -> Void)?
     var onStatusChanged: (@MainActor @Sendable (String) -> Void)?
 
+    private let defaults = UserDefaults.standard
+
+    override init() { super.init() }
+
     func setCallbacks(
         onModelReady: (@MainActor @Sendable () -> Void)?,
         onStatusChanged: (@MainActor @Sendable (String) -> Void)?,
@@ -51,81 +55,58 @@ actor AudioStreamManager: NSObject {
         self.onSubtitleSnapshot = onSubtitleSnapshot
     }
 
-    private nonisolated let defaults = UserDefaults.standard
-
-    override init() {
-        super.init()
-    }
-
-    func setTranslationSession(_ session: TranslationSession) {
+    func setTranslationSession(_ session: TranslationSession?) {
+        sessionLock.lock()
         self.translationSession = session
+        sessionLock.unlock()
     }
 
-    // MARK: - Setup & Model Management
-    
+    // MARK: - Setup & Capture
     func prepareModel() async {
         if isCapturing { stopCapture() }
+        await sendStatus("Initializing model...")
         
-        await sendStatus("Khởi tạo Sherpa-onnx model...")
-        
-        let appSupportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let modelsDirectory = appSupportURL.appendingPathComponent("ParrotIsle/sherpa", isDirectory: true)
-        
-        let encoderPath = modelsDirectory.appendingPathComponent("encoder.onnx").path
-        let decoderPath = modelsDirectory.appendingPathComponent("decoder.onnx").path
-        let joinerPath = modelsDirectory.appendingPathComponent("joiner.onnx").path
-        let tokensPath = modelsDirectory.appendingPathComponent("tokens.txt").path
-        
-        guard FileManager.default.fileExists(atPath: encoderPath) else {
-            print("Lỗi: Không tìm thấy file model ONNX trong \(modelsDirectory.path)")
-            await sendStatus("Lỗi: Không tìm thấy file model ONNX trong \(modelsDirectory.path)")
+        guard let encoderPath = Bundle.main.path(forResource: "encoder", ofType: "onnx"),
+              let decoderPath = Bundle.main.path(forResource: "decoder", ofType: "onnx"),
+              let joinerPath  = Bundle.main.path(forResource: "joiner", ofType: "onnx"),
+              let tokensPath  = Bundle.main.path(forResource: "tokens", ofType: "txt")
+        else {
+            await sendStatus("Error: Model files not found.")
             return
         }
         
-        // SỬ DỤNG HELPER FUNCTIONS CỦA SHERPAONNX.SWIFT
-        let featConfig = await sherpaOnnxFeatureConfig(
-            sampleRate: sampleRate,
-            featureDim: 80
-        )
-        
-        let transducerConfig = await sherpaOnnxOnlineTransducerModelConfig(
-            encoder: encoderPath,
-            decoder: decoderPath,
-            joiner: joinerPath
-        )
-        
-        let modelConfig = await sherpaOnnxOnlineModelConfig(
-            tokens: tokensPath,
-            transducer: transducerConfig,
-            numThreads: 4,
-            debug: 0
-        )
-        
-        var config = await sherpaOnnxOnlineRecognizerConfig(
-            featConfig: featConfig,
-            modelConfig: modelConfig,
-            enableEndpoint: true,
-            rule1MinTrailingSilence: 1.2,
-            rule2MinTrailingSilence: 0.8,
-            rule3MinUtteranceLength: 20.0
-        )
-        
-        // Khởi tạo (Stream đã được bọc ngầm bên trong class này)
-        self.recognizer = await SherpaOnnxRecognizer(config: &config)
-        
-        if self.recognizer == nil {
-            await sendStatus("Lỗi: Không thể khởi tạo Sherpa-onnx.")
-        } else {
-            await sendStatus("Sẵn sàng!")
-            let cb = onModelReady
-            await MainActor.run { cb?() }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            
+            let featConfig = sherpaOnnxFeatureConfig(sampleRate: self.sampleRate, featureDim: 80)
+            let transducerConfig = sherpaOnnxOnlineTransducerModelConfig(encoder: encoderPath, decoder: decoderPath, joiner: joinerPath)
+            let modelConfig = sherpaOnnxOnlineModelConfig(tokens: tokensPath, transducer: transducerConfig, numThreads: 4, debug: 0)
+            
+            var config = sherpaOnnxOnlineRecognizerConfig(
+                featConfig: featConfig,
+                modelConfig: modelConfig,
+                enableEndpoint: true,
+                rule1MinTrailingSilence: 1.2,
+                rule2MinTrailingSilence: 0.8,
+                rule3MinUtteranceLength: 20.0
+            )
+            
+            let newRecognizer = SherpaOnnxRecognizer(config: &config)
+            
+            self.sherpaQueue.async {
+                self.recognizer = newRecognizer
+                Task {
+                    await self.sendStatus("Ready!")
+                    await MainActor.run { self.onModelReady?() }
+                }
+            }
         }
     }
     
-    // MARK: - Capture Control
     func startCapture() async -> Bool {
-        guard recognizer != nil else {
-            await sendStatus("Model chưa sẵn sàng.")
+        let isReady = sherpaQueue.sync { recognizer != nil }
+        guard isReady else {
+            await sendStatus("Model is not ready.")
             return false
         }
         guard !isCapturing else { return true }
@@ -137,32 +118,37 @@ actor AudioStreamManager: NSObject {
             let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
             let streamConfig = SCStreamConfiguration()
             
-            // Cấu hình chuẩn cho Audio
+            // CHỈ THU AUDIO - Bỏ Video để tránh lỗi đồng bộ luồng
             streamConfig.capturesAudio = true
             streamConfig.excludesCurrentProcessAudio = true
             streamConfig.sampleRate = sampleRate
             streamConfig.channelCount = 1
             streamConfig.queueDepth = 5
 
-            let bridge = await StreamBridge(manager: self)
+            let bridge = StreamBridge(manager: self)
             self.streamBridge = bridge
             let newStream = SCStream(filter: filter, configuration: streamConfig, delegate: bridge)
             
-            // Hứng luồng Audio (Luồng chính cần xử lý)
-            try newStream.addStreamOutput(bridge, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
-            
-            // Hứng luồng Video (Chỉ để chặn cái log spam Dropping frame của Apple, hứng xong vứt luôn)
-            try newStream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: .global(qos: .background))
+            let audioQueue = DispatchQueue(label: "com.parrotisle.audio", qos: .userInteractive)
+            try newStream.addStreamOutput(bridge, type: .audio, sampleHandlerQueue: audioQueue)
             
             try await newStream.startCapture()
 
             scStream = newStream
-            resetState()
             isCapturing = true
-            await sendStatus("Đang nghe âm thanh hệ thống...")
+            
+            sherpaQueue.async {
+                self.committedText = ""
+                self.liveText = ""
+                self.recognizer?.reset()
+                self.isDecodingRunning = true
+                self.runDecodingLoop()
+            }
+            
+            await sendStatus("Listening to system audio...")
             return true
         } catch {
-            await sendStatus("Lỗi capture: \(error.localizedDescription)")
+            await sendStatus("Capture error: \(error.localizedDescription)")
             return false
         }
     }
@@ -172,60 +158,84 @@ actor AudioStreamManager: NSObject {
         scStream = nil
         streamBridge = nil
         isCapturing = false
-        resetState()
+        
+        activeTranslationTask?.cancel()
+        
+        sherpaQueue.async {
+            self.isDecodingRunning = false
+            self.committedText = ""
+            self.liveText = ""
+            self.recognizer?.reset()
+        }
+        
         Task.detached { try? await s?.stopCapture() }
-    }
-
-    private func resetState() {
-        committedText = ""
-        liveText = ""
-        recognizer?.reset() // Wrapper tự xử lý reset stream bên trong
     }
 
     // MARK: - Core Realtime Processing
     func ingestSamples(_ samples: [Float]) {
-        guard isCapturing, let recognizer = recognizer else { return }
-
-        // Gọi thẳng từ recognizer (Nó đã giữ stream bên trong)
-        recognizer.acceptWaveform(samples: samples, sampleRate: sampleRate)
-
-        while recognizer.isReady() {
-            recognizer.decode()
-        }
-
-        let partialText = recognizer.getResult().text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isCapturing else { return }
         
-        let changed = partialText != liveText
-        if changed {
-            liveText = partialText
-            pushSnapshot()
-        }
-
-        // Kiểm tra dứt câu
-        if recognizer.isEndpoint() {
-            if !liveText.isEmpty {
-                let separator = committedText.isEmpty ? "" : " "
-                let combined = committedText + separator + liveText
-                let words = combined.split(separator: " ").map { String($0) }
-                
-                var tempLines: [String] = []
-                var tLine = ""
-                for w in words {
-                    if tLine.isEmpty { tLine = w }
-                    else if tLine.count + 1 + w.count <= 40 { tLine += " " + w }
-                    else { tempLines.append(tLine); tLine = w }
-                }
-                if !tLine.isEmpty { tempLines.append(tLine) }
-                
-                if tempLines.count > 4 {
-                    committedText = tempLines.suffix(4).joined(separator: " ")
-                } else {
-                    committedText = combined
+        sherpaQueue.async { [weak self] in
+            guard let self = self, self.isCapturing, let recognizer = self.recognizer else { return }
+            
+            var cleanSamples = samples
+            for i in 0..<cleanSamples.count {
+                if cleanSamples[i].isNaN || cleanSamples[i].isInfinite {
+                    cleanSamples[i] = 0.0
                 }
             }
-            liveText = ""
-            pushSnapshot()
-            recognizer.reset() // Bắt đầu câu mới
+            recognizer.acceptWaveform(samples: cleanSamples, sampleRate: self.sampleRate)
+        }
+    }
+
+    private func runDecodingLoop() {
+        guard isDecodingRunning, let recognizer = recognizer else { return }
+        
+        var didDecode = false
+        while recognizer.isReady() {
+            recognizer.decode()
+            didDecode = true
+        }
+
+        // CHỈ check và cập nhật text nếu Sherpa có nhai thêm data
+        if didDecode {
+            if let partialText = recognizer.getResult()?.text.trimmingCharacters(in: .whitespacesAndNewlines) {
+                let changed = partialText != liveText
+                if changed {
+                    liveText = partialText
+                    pushSnapshot()
+                }
+
+                if recognizer.isEndpoint() {
+                    if !liveText.isEmpty {
+                        let separator = committedText.isEmpty ? "" : " "
+                        let combined = committedText + separator + liveText
+                        let words = combined.split(separator: " ").map { String($0) }
+                        
+                        var tempLines: [String] = []
+                        var tLine = ""
+                        for w in words {
+                            if tLine.isEmpty { tLine = w }
+                            else if tLine.count + 1 + w.count <= 40 { tLine += " " + w }
+                            else { tempLines.append(tLine); tLine = w }
+                        }
+                        if !tLine.isEmpty { tempLines.append(tLine) }
+                        
+                        if tempLines.count > 4 {
+                            committedText = tempLines.suffix(4).joined(separator: " ")
+                        } else {
+                            committedText = combined
+                        }
+                    }
+                    liveText = ""
+                    pushSnapshot()
+                    recognizer.reset()
+                }
+            }
+        }
+        
+        sherpaQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.runDecodingLoop()
         }
     }
 
@@ -233,53 +243,83 @@ actor AudioStreamManager: NSObject {
         let rawCommitted = committedText
         let rawLive = liveText
         
+        let sourceId = defaults.string(forKey: "sourceLanguage") ?? "en"
+        let targetId = defaults.string(forKey: "targetLanguage") ?? "none"
+        let isTranslating = (targetId != "none" && sourceId != targetId)
+        
+        let fullRawText = [rawCommitted, rawLive]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        
+        guard !fullRawText.isEmpty else { return }
+        
+        // 1. NẾU KHÔNG DỊCH: Bắn thẳng UI, không Debounce (Cực nhạy)
+        if !isTranslating {
+            activeTranslationTask?.cancel()
+            let displayLines = self.formatToLines(text: fullRawText)
+            let snapshot = SubtitleSnapshot(stableLines: displayLines, pendingText: "")
+            
+            if let cb = self.onSubtitleSnapshot {
+                Task { @MainActor in cb(snapshot) }
+            }
+            return
+        }
+        
+        // 2. NẾU CÓ DỊCH: Sử dụng Debounce 250ms để chống crash/spam API Apple
         activeTranslationTask?.cancel()
-        activeTranslationTask = Task {
-            let fullRawText = [rawCommitted, rawLive]
-                .filter { !$0.isEmpty }
-                .joined(separator: " ")
+        
+        sessionLock.lock()
+        let currentSession = translationSession
+        sessionLock.unlock()
+        
+        activeTranslationTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if Task.isCancelled { return }
             
-            if fullRawText.isEmpty { return }
-            
-            let sourceId = defaults.string(forKey: "sourceLanguage") ?? "en"
-            let targetId = defaults.string(forKey: "targetLanguage") ?? "none"
             var translatedText = fullRawText
-            
-            if targetId != "none", sourceId != targetId, let session = await self.translationSession {
+            if let session = currentSession {
                 do {
                     let response = try await session.translations(from: [TranslationSession.Request(sourceText: fullRawText)])
+                    if Task.isCancelled { return }
                     translatedText = response.first?.targetText ?? fullRawText
                 } catch {
-                    print("Translation error: \(error)")
+                    if !(error is CancellationError) { print("Translation error: \(error)") }
                 }
             }
             
             if Task.isCancelled { return }
             
-            let words = translatedText.split(separator: " ").map { String($0) }
-            var lines: [String] = []
-            var currentLine = ""
-            for word in words {
-                if currentLine.isEmpty { currentLine = word }
-                else if currentLine.count + 1 + word.count <= 45 { currentLine += " " + word }
-                else { lines.append(currentLine); currentLine = word }
-            }
-            if !currentLine.isEmpty { lines.append(currentLine) }
-            
-            let displayLines = Array(lines.suffix(2))
+            let displayLines = self?.formatToLines(text: translatedText) ?? []
             let snapshot = SubtitleSnapshot(stableLines: displayLines, pendingText: "")
             
-            let cb = onSubtitleSnapshot
-            await MainActor.run { cb?(snapshot) }
+            if let cb = self?.onSubtitleSnapshot {
+                await MainActor.run { cb(snapshot) }
+            }
         }
+    }
+    
+    // Hàm format chữ tách ra cho gọn
+    private func formatToLines(text: String) -> [String] {
+        let words = text.split(separator: " ").map { String($0) }
+        var lines: [String] = []
+        var currentLine = ""
+        for word in words {
+            if currentLine.isEmpty { currentLine = word }
+            else if currentLine.count + 1 + word.count <= 45 { currentLine += " " + word }
+            else { lines.append(currentLine); currentLine = word }
+        }
+        if !currentLine.isEmpty { lines.append(currentLine) }
+        return Array(lines.suffix(2))
     }
 
     private func sendStatus(_ msg: String) async {
-        let cb = onStatusChanged
-        await MainActor.run { cb?(msg) }
+        if let cb = onStatusChanged {
+            await MainActor.run { cb(msg) }
+        }
     }
 }
 
+// Lớp cầu nối Audio
 private final class StreamBridge: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private weak var manager: AudioStreamManager?
 
@@ -294,15 +334,16 @@ private final class StreamBridge: NSObject, SCStreamOutput, SCStreamDelegate, @u
               !samples.isEmpty,
               let mgr = manager else { return }
 
-        Task { await mgr.ingestSamples(samples) }
+        mgr.ingestSamples(samples)
     }
 
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         guard let mgr = manager else { return }
-        Task {
-            await mgr.stopCapture()
-            let cb = await mgr.onStatusChanged
-            await MainActor.run { cb?("Capture stopped: \(error.localizedDescription)") }
+        mgr.stopCapture()
+        Task { [weak mgr] in
+            if let cb = mgr?.onStatusChanged {
+                await MainActor.run { cb("Capture stopped: \(error.localizedDescription)") }
+            }
         }
     }
 
@@ -341,4 +382,3 @@ private final class StreamBridge: NSObject, SCStreamOutput, SCStreamDelegate, @u
         return result
     }
 }
-

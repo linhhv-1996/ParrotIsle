@@ -294,12 +294,13 @@ class SherpaOnnxRecognizer {
   }
 
   /// Get the decoding results so far
-  func getResult() -> SherpaOnnxOnlineRecongitionResult {
-    guard let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) else {
-      fatalError("SherpaOnnxGetOnlineStreamResult returned nil")
+    func getResult() -> SherpaOnnxOnlineRecongitionResult? {
+        guard let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) else {
+          print("[CẢNH BÁO] SherpaOnnxGetOnlineStreamResult trả về nil. Bỏ qua frame.")
+          return nil
+        }
+        return SherpaOnnxOnlineRecongitionResult(result: result)
     }
-    return SherpaOnnxOnlineRecongitionResult(result: result)
-  }
 
   /// Reset the recognizer, which clears the neural network model state
   /// and the state for decoding.

@@ -23,7 +23,7 @@ final class UIState: ObservableObject {
     
     var isRecording: Bool { status == .recording }
     var hasScreenRecordPermission: Bool = false
-    private var isModelLoaded: Bool = false // Biến mới để theo dõi xem model đã nạp chưa
+    private var isModelLoaded: Bool = false
 
     private let audioManager = AudioStreamManager()
 
@@ -41,15 +41,12 @@ final class UIState: ObservableObject {
     }
 
     init() {
-        // 1. Cài đặt các callback nhận data từ AudioManager
         Task {
             await setupCallbacks()
-            // 2. Check quyền NGAY TRƯỚC KHI quyết định load model
             checkPermission()
             updateStatusBasedOnState()
         }
         
-        // 3. Lắng nghe sự kiện khi app được mở lại (Ví dụ sau khi user vào Settings cấp quyền xong)
         Task { @MainActor [weak self] in
             let notifications = NotificationCenter.default.notifications(named: NSApplication.didBecomeActiveNotification)
             for await _ in notifications {
@@ -69,9 +66,9 @@ final class UIState: ObservableObject {
             },
             onStatusChanged: { [weak self] statusMsg in
                 let lowerMsg = statusMsg.lowercased()
-                if lowerMsg.contains("failed") || lowerMsg.contains("lỗi") || lowerMsg.contains("không tìm thấy") {
+                if lowerMsg.contains("failed") || lowerMsg.contains("error") || lowerMsg.contains("not found") {
                     self?.status = .error(statusMsg)
-                } else if lowerMsg.contains("khởi tạo") {
+                } else if lowerMsg.contains("initializing") {
                     self?.status = .loadingModel
                 }
             },
@@ -99,14 +96,13 @@ final class UIState: ObservableObject {
     }
     
     private func updateStatusBasedOnState() {
-        // Đang record thì không đổi status lung tung
+        // KHÔNG update status linh tinh nếu đang thu âm
         if status == .recording { return }
         
         if !hasScreenRecordPermission {
             status = .missingPermission
         } else if !isModelLoaded {
-            // Nếu đã có quyền NHƯNG model chưa được load -> Gọi hàm load model
-            if case .error = status { return } // Tránh load lại liên tục nếu đang dính lỗi đường dẫn
+            if case .error = status { return }
             if status != .loadingModel {
                 status = .loadingModel
                 Task { await audioManager.prepareModel() }
@@ -129,32 +125,40 @@ final class UIState: ObservableObject {
         } else if status == .missingPermission {
             requestPermission()
         } else if case .error(_) = status {
-            // Nếu click vào Dynamic Island khi đang báo lỗi -> Thử load lại model
             status = .loadingModel
             Task { await audioManager.prepareModel() }
         }
     }
 
     private func startRecording() {
+        // Đổi UI ngay lập tức cho mượt
+        status = .recording
         Task {
             let didStart = await audioManager.startCapture()
-            if didStart {
-                await MainActor.run { self.status = .recording }
-            } else {
-                await MainActor.run { self.updateStatusBasedOnState() }
+            if !didStart {
+                // Nếu backend fail, trả lại trạng thái cũ
+                await MainActor.run {
+                    self.status = .ready
+                    self.updateStatusBasedOnState()
+                }
             }
         }
     }
 
     func stopRecording() {
+        // Đổi UI ngay lập tức thoát khỏi trạng thái recording
+        self.status = .ready
         stableLines = []
         pendingText = ""
+        
         Task {
+            // Backend từ từ ngắt stream sau
             await audioManager.stopCapture()
             await MainActor.run { self.updateStatusBasedOnState() }
         }
     }
 }
+
 
 // MARK: - Views (Phần UI giữ nguyên)
 struct DynamicIslandView: View {
