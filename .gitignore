@@ -1,0 +1,27 @@
+# macOS System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode Build Artifacts & Noise
+build/
+DerivedData/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+
+# Swift Package Manager (optional: keep .resolved to lock versions)
+.build/
+.swiftpm/
+# Package.resolved
+
+# External Dependency Managers (if applicable)
+Pods/
+Carthage/Build/
+ParrotIsle/model/
